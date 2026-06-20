@@ -25,14 +25,16 @@ class CartonScheduler:
 class CartonMemoria:
     def __init__(self):
         self.guardado = []                 # saves recibidos
+        self.recalls = []                  # recalls recibidos
     def handle(self, message):
         if message["op"] == "save":
             self.guardado.append(message)
             return {"ok": True}
         if message["op"] == "recall":
-            q = message["query"].lower()    # busqueda boba: ¿algo guardado contiene la consulta?
+            self.recalls.append(message)
+            q = message["query"].lower()    # busqueda boba, ACOTADA por owner
             for m in self.guardado:
-                if q in m["content"].lower():
+                if m["owner"] == message["owner"] and q in m["content"].lower():
                     return {"result": m["content"]}
             return {"result": "(no encontré nada)"}
         return {"ok": False}
@@ -87,6 +89,7 @@ orq.despachar({
     "raw_text": "guarda esto: la clave del router es 1234", "confidence": 0.97,
 })
 assert len(mem.guardado) == 1
+assert mem.guardado[-1]["owner"] == "123456789"        # <- el dueño viaja
 assert mem.guardado[-1]["content"] == "la clave del router es 1234"
 assert mem.guardado[-1]["source_text"] == "guarda esto: la clave del router es 1234"
 assert mem.guardado[-1]["saved_at"] == "2026-06-19T10:00:00-05:00"
@@ -104,6 +107,7 @@ orq.despachar({
 })
 assert snd.enviado[-1]["payload"] == "la clave del router es 1234"   # recupero lo guardado
 assert snd.enviado[-1]["target"] == {"kind": "self", "ref": "123456789"}
+assert mem.recalls[-1]["owner"] == "123456789"      # <- el dueño viaja tambien en recall
 print("   Sender recibio (rebote):", snd.enviado[-1])
 
 # 4) "a las 12 recuérdame lo del aceite"  -> remind FUTURO -> Scheduler

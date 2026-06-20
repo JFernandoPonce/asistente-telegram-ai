@@ -71,9 +71,10 @@ class Orquestador:
             self.sender.send({"target": intent["target"], "payload": intent["payload"]})
 
         elif action == "save":
-            # Guardar es para uno mismo: content + texto original + timestamp. Sin target.
+            # Guardar es para uno mismo: owner + content + texto original + timestamp.
             self.memoria.handle({
                 "op": "save",
+                "owner": intent["target"]["ref"],   # chat_id horneado en captura (ADR-0005)
                 "content": intent["payload"],
                 "source_text": intent["raw_text"],
                 "saved_at": self.clock(),
@@ -82,7 +83,11 @@ class Orquestador:
 
         elif action == "recall":
             # recall REBOTA: Memoria devuelve un result, que mandamos de vuelta al usuario.
-            respuesta = self.memoria.handle({"op": "recall", "query": intent["payload"]})
+            respuesta = self.memoria.handle({
+                "op": "recall",
+                "owner": intent["target"]["ref"],   # mismo dueño con el que se guardo (ADR-0005)
+                "query": intent["payload"],
+            })
             self.sender.send({"target": intent["target"], "payload": respuesta["result"]})
 
         else:
