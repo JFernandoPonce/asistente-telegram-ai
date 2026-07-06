@@ -129,10 +129,16 @@ def main() -> None:
         Application, CommandHandler, MessageHandler, filters, ContextTypes,
     )
 
+    from sender import Sender
+
     load_dotenv()
     token = os.environ["BOT_TOKEN"]   # revienta claro si falta
 
-    orq, sched, _sender = construir_grafo("memoria.db", "scheduler.db")
+    # La app se crea ANTES del grafo: el Sender real necesita `application` (puente
+    # sync->async via create_task). Se inyecta el Sender real en lugar del StubSender.
+    app = Application.builder().token(token).build()
+    sender = Sender(app)
+    orq, sched, _sender = construir_grafo("memoria.db", "scheduler.db", sender=sender)
 
     # --- Inyector temporal de Intent: /recuerda <segundos> <texto...> ---
     async def cmd_recuerda(update: "Update", context: "ContextTypes.DEFAULT_TYPE") -> None:
@@ -155,13 +161,12 @@ def main() -> None:
         logger.info("Recibido de %s: %s", update.effective_user.id, update.message.text)
         await update.message.reply_text(update.message.text)
 
-    app = Application.builder().token(token).build()
     app.add_handler(CommandHandler("recuerda", cmd_recuerda))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo))
 
     # --- Heartbeat prescrito por la Spec: run_repeating(tick, 15, first=0) ---
     async def _latido(context: "ContextTypes.DEFAULT_TYPE") -> None:
-        sched.tick()   # sincrono; en Stage A el stub no requiere await
+        sched.tick()   # sincrono; el Sender encola la corrutina (create_task), no bloquea
 
     if app.job_queue is None:
         raise RuntimeError(
