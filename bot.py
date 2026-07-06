@@ -175,7 +175,7 @@ def main() -> None:
         )
     app.job_queue.run_repeating(_latido, interval=15, first=0)
 
-    logger.info("Bot arrancado (Stage A: Scheduler cableado + Sender stub). Polling...")
+    logger.info("Bot arrancado (Stage B: Scheduler + Sender real cableados). Polling...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
