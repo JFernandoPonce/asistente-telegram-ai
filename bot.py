@@ -17,8 +17,17 @@ verdadero pipeline de interpretacion:
     texto -> construir_context -> interpretar(text, ctx)  [interpreter.py: Gemini extrae / Python valida]
           -> Intent congelado -> orq.despachar     (o unknown -> el bot repregunta)
 
-`construir_context` es el MISMO helper que reutilizara U3 (voz): arma el carril `context`
-opaco (now + tz + sender) que el Contrato Captura define para las fronteras 5 y 6.
+UPSTREAM U3 (nuevo): el frente de VOZ. Un handler `on_voice` arma F5 desde la nota de voz
+(audio + mime + duration_s + context), la pasa por Transcripcion (U2, transcriber.py) y entra
+a la MISMA cola compartida que el texto:
+
+    voz -> construir_context -> transcribir(audio, mime, dur, ctx)  [U2: Gemini oye]
+        -> (texto, ctx) -> procesar(...) -> interpretar -> despachar / repreguntar
+
+`construir_context` es el MISMO helper para texto y voz: arma el carril `context` opaco
+(now + tz + sender) que el Contrato Captura define para las fronteras 5 y 6. La cola comun
+(interpretar -> despachar/acuse) vive UNA sola vez en `procesar` (DRY): texto y voz solo
+difieren en como consiguen el `text` (crudo vs transcrito).
 
 Piezas PURAS (sin Telegram) al nivel de modulo -> se prueban en aislamiento
 (prueba_integracion.py, prueba_bot_context.py). Todo lo de Telegram vive dentro de main().
@@ -181,6 +190,7 @@ def main() -> None:
 
     from sender import Sender
     from interpreter import interpretar   # caja LLM upstream (Gemini extrae / Python valida)
+    from transcriber import transcribir   # caja U2: transcripcion voz->texto (Gemini oye)
 
     load_dotenv()
     token = os.environ["BOT_TOKEN"]   # revienta claro si falta
@@ -191,13 +201,17 @@ def main() -> None:
     sender = Sender(app)
     orq, sched, _sender = construir_grafo("memoria.db", "scheduler.db", sender=sender)
 
-    # --- UPSTREAM U1: mensaje de texto -> interpretar -> despachar ---
-    #     Reemplaza el andamio /recuerda y el echo. La voz (U3) entrara por el mismo
-    #     construir_context, agregando solo el paso de Transcripcion antes de interpretar.
-    async def on_text(update: "Update", context: "ContextTypes.DEFAULT_TYPE") -> None:
-        text = update.message.text
-        ctx = construir_context(update)
-        logger.info("Recibido de %s: %r", ctx["sender"]["chat_id"], text)
+    # --- UPSTREAM U1 (texto) + U3 (voz) -> interpretar -> despachar ---
+    #     El andamio /recuerda y el echo ya fueron retirados. Texto y voz comparten la
+    #     MISMA cola (`procesar`, D1); solo difieren en como consiguen el `text`:
+    #       - on_text : lo lee crudo de update.message.text
+    #       - on_voice: lo obtiene de Transcripcion (U2) sobre la nota de voz.
+
+    async def procesar(update: "Update", text: str, ctx: dict) -> None:
+        """Cola COMPARTIDA texto/voz (D1). Todo lo que sigue tras tener (text, ctx)
+        vive AQUI, una sola vez: interpretar -> despachar / repreguntar.
+        `update` solo se usa para responder (reply_text)."""
+        logger.info("Interpretando de %s: %r", ctx["sender"]["chat_id"], text)
 
         intent = await interpretar(text, ctx)   # async: Gemini + validador determinista
 
@@ -205,10 +219,52 @@ def main() -> None:
             await update.message.reply_text(confirmar(intent))
             return
 
-        orq.despachar(intent)                   # sync; camino inmediato o diferido segun `when`
+        orq.despachar(intent)                   # sync; inmediato o diferido segun `when`
         await update.message.reply_text(confirmar(intent))
 
+    async def on_text(update: "Update", context: "ContextTypes.DEFAULT_TYPE") -> None:
+        text = update.message.text
+        ctx = construir_context(update)
+        await procesar(update, text, ctx)
+
+    async def on_voice(update: "Update", context: "ContextTypes.DEFAULT_TYPE") -> None:
+        """Handler de VOZ (U3). Arma F5 desde la nota de voz -> transcribe (U2) ->
+        entra a la cola compartida (D1). No toca ninguna caja congelada."""
+        voice = update.message.voice
+        ctx = construir_context(update)          # MISMO helper que el texto (U1)
+
+        # Bajar el audio -> `audio: bytes` de la Frontera 5.
+        tg_file = await voice.get_file()
+        audio = bytes(await tg_file.download_as_bytearray())
+        mime = voice.mime_type or "audio/ogg"    # default defensivo (D-CAP-3: mime es opcional)
+        duration_s = voice.duration
+
+        logger.info("Voz de %s: %d bytes, %ss, mime=%s",
+                    ctx["sender"]["chat_id"], len(audio), duration_s, mime)
+
+        # Transcripcion (U2). La caja propaga el error CRUDO por diseno; aqui se ENVUELVE
+        # para que el bot repregunte en vez de crashear (el "manejo elegante vive en la costura").
+        try:
+            resultado = await transcribir(audio, mime, duration_s, ctx)
+        except Exception:
+            logger.exception("Transcripcion fallo")
+            await update.message.reply_text("🎤 No pude entender el audio, ¿lo repites?")
+            return
+
+        text = resultado["text"]
+        ctx = resultado["context"]               # passthrough F6: el MISMO context, intacto
+
+        if not text:
+            await update.message.reply_text("🎤 No capté nada en el audio, ¿lo repites?")
+            return
+
+        # U-eco: mostrar lo que se OYO antes de actuar (red de seguridad contra mal-oido).
+        await update.message.reply_text(f"🎤 Entendí: «{text}»")
+
+        await procesar(update, text, ctx)
+
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    app.add_handler(MessageHandler(filters.VOICE, on_voice))
 
     # --- Heartbeat prescrito por la Spec: run_repeating(tick, 15, first=0) ---
     async def _latido(context: "ContextTypes.DEFAULT_TYPE") -> None:
@@ -221,7 +277,7 @@ def main() -> None:
         )
     app.job_queue.run_repeating(_latido, interval=15, first=0)
 
-    logger.info("Bot arrancado (U1: upstream texto->LLM->Intent + Scheduler + Sender real). Polling...")
+    logger.info("Bot arrancado (U1 texto + U3 voz -> LLM -> Intent + Scheduler + Sender real). Polling...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
